@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Settings - Emby-Trakt Watch Party</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface-hover: #22263a;
+    --border: #2a2e3e;
+    --text: #e0e0e6;
+    --text-dim: #8b8fa3;
+    --accent: #6c5ce7;
+    --accent-light: #a29bfe;
+    --green: #00b894;
+    --orange: #fdcb6e;
+    --red: #e17055;
+    --blue: #74b9ff;
+    --radius: 10px;
+    --font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  .header {
+    padding: 28px 32px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px;
+  }
+  .header h1 { font-size: 1.5rem; font-weight: 700; }
+  .header .version { font-size: 0.75rem; color: var(--text-dim); background: var(--surface); padding: 2px 8px; border-radius: 4px; }
+
+  .nav {
+    padding: 12px 32px;
+    border-bottom: 1px solid var(--border);
+    display: flex; gap: 4px;
+  }
+  .nav a {
+    color: var(--text); text-decoration: none; font-size: 0.9rem;
+    padding: 7px 12px; border-radius: 6px;
+  }
+  .nav a:hover { background: var(--surface-hover); }
+
+  .container { max-width: 900px; margin: 0 auto; padding: 28px 32px; }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+  .card h3 { font-size: 1.1rem; margin-bottom: 16px; font-weight: 600; }
+
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 0.85rem; color: var(--text-dim); margin-bottom: 6px; }
+  .field input[type="text"] {
+    width: 100%;
+    padding: 10px 14px;
+    background: #111318;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 0.9rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .field input:focus { outline: none; border-color: var(--accent); }
+
+  .btn {
+    display: inline-block; padding: 10px 20px; border-radius: 8px;
+    border: none; cursor: pointer; font-size: 0.9rem; font-weight: 600;
+    color: #fff; background: var(--accent); text-decoration: none;
+  }
+  .btn:hover { background: var(--accent-light); color: #111; }
+  .btn-outline {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+  }
+  .btn-outline:hover { border-color: var(--accent); color: var(--accent-light); }
+  .btn-danger { background: var(--red); }
+  .btn-danger:hover { background: #c0392b; color: #fff; }
+
+  .status-msg {
+    padding: 10px 16px; border-radius: 8px; margin-top: 12px; font-size: 0.85rem;
+  }
+  .status-ok { background: rgba(0,184,148,0.15); color: var(--green); }
+  .status-err { background: rgba(225,112,85,0.15); color: var(--red); }
+
+  .section-divider { border-top: 1px solid var(--border); margin: 24px 0; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>⚙️ Settings</h1>
+  <span class="version">v1.0.0</span>
+</div>
+
+<div class="nav">
+  <a href="/">🏠 Dashboard</a>
+  <a href="/watch-party">👥 Watch Party</a>
+</div>
+
+<div class="container">
+
+  <!-- Connection Settings -->
+  <div class="card">
+    <h3>🔌 Connection Settings</h3>
+    <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:16px;">
+      These values are read from your <code>.env</code> file. Edit the file and restart the container to change them.
+    </p>
+
+    <div id="settingsFields">Loading…</div>
+
+    <div style="display:flex; gap:10px; margin-top:16px; flex-wrap:wrap;">
+      <button class="btn btn-outline" onclick="testConnection('trakt')">Test Trakt</button>
+      <button class="btn btn-outline" onclick="testConnection('emby')">Test Emby</button>
+    </div>
+
+    <div id="testResult"></div>
+  </div>
+
+  <!-- Trakt Account Link -->
+  <div class="card">
+    <h3>🔗 Trakt Account</h3>
+    <div id="traktUsers">Loading…</div>
+    <div style="margin-top:16px;">
+      <button class="btn btn-outline" onclick="resetOAuth()">Reset OAuth Tokens</button>
+    </div>
+    <div id="oauthResult"></div>
+  </div>
+
+  <!-- Database -->
+  <div class="card">
+    <h3>💾 Database</h3>
+    <div style="display:flex; gap:10px; flex-wrap:wrap;">
+      <button class="btn btn-outline" onclick="createBackup()">Create Backup</button>
+      <label class="btn btn-outline" style="cursor:pointer;">
+        Restore Backup
+        <input type="file" accept=".sql" style="display:none;" onchange="restoreBackup(this)">
+      </label>
+    </div>
+    <div id="dbResult"></div>
+  </div>
+
+  <!-- Danger Zone -->
+  <div class="card" style="border-color: rgba(225,112,85,0.3);">
+    <h3 style="color:var(--red);">⚠️ Danger Zone</h3>
+    <p style="color:var(--text-dim); font-size:0.85rem; margin-bottom:16px;">
+      Factory reset removes all users, watch party history, and linked accounts. This cannot be undone.
+    </p>
+    <button class="btn btn-danger" onclick="factoryReset()">Factory Reset</button>
+    <div id="dangerResult"></div>
+  </div>
+
+</div>
+
+<script>
+const API = '';
+
+async function loadSettings() {
+  const el = document.getElementById('settingsFields');
+  try {
+    const r = await fetch(API + '/api/settings');
+    const d = await r.json();
+    el.innerHTML = `
+      <div class="field"><label>Trakt Client ID</label><input type="text" value="${d.trakt_client_id}" readonly></div>
+      <div class="field"><label>Trakt Client Secret</label><input type="text" value="${d.trakt_client_secret}" readonly></div>
+      <div class="field"><label>Emby URL</label><input type="text" value="${d.emby_url}" readonly></div>
+      <div class="field"><label>Emby API Key</label><input type="text" value="${d.emby_api_key}" readonly></div>
+    `;
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--red)">Failed to load settings</span>';
+  }
+}
+
+async function loadTraktUsers() {
+  const el = document.getElementById('traktUsers');
+  try {
+    const r = await fetch(API + '/auth/users');
+    const users = await r.json();
+    if (!users.length) {
+      el.innerHTML = '<p style="color:var(--text-dim)">No users yet. Create a watch party to link accounts.</p>';
+      return;
+    }
+    let html = '<table style="width:100%;"><thead><tr><th style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text-dim);font-size:0.8rem;">Emby User</th><th style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text-dim);font-size:0.8rem;">Trakt</th><th style="padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text-dim);font-size:0.8rem;">Status</th></tr></thead><tbody>';
+    for (const u of users) {
+      const badge = u.linked
+        ? `<span style="color:var(--green)">${u.token_status || 'linked'}</span>`
+        : '<span style="color:var(--text-dim)">not linked</span>';
+      html += `<tr><td style="padding:8px 12px;border-bottom:1px solid var(--border);">${u.emby_username || u.emby_user_id}</td><td style="padding:8px 12px;border-bottom:1px solid var(--border);">${u.trakt_username || '—'}</td><td style="padding:8px 12px;border-bottom:1px solid var(--border);">${badge}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  } catch(e) {
+    el.innerHTML = '<span style="color:var(--red)">Failed to load users</span>';
+  }
+}
+
+async function testConnection(service) {
+  const el = document.getElementById('testResult');
+  el.innerHTML = '<div class="status-msg" style="background:rgba(116,185,255,0.15);color:var(--blue);">Testing ' + service + '…</div>';
+  try {
+    const r = await fetch(API + '/api/settings/test-connection', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({service}),
+    });
+    const d = await r.json();
+    if (d.status === 'ok') {
+      el.innerHTML = `<div class="status-msg status-ok">✓ ${service} connection successful</div>`;
+    } else {
+      el.innerHTML = `<div class="status-msg status-err">✗ ${service}: ${d.message || 'failed'}</div>`;
+    }
+  } catch(e) {
+    el.innerHTML = `<div class="status-msg status-err">✗ Request failed: ${e.message}</div>`;
+  }
+}
+
+async function resetOAuth() {
+  if (!confirm('This will clear all Trakt tokens. Users will need to re-link. Continue?')) return;
+  const el = document.getElementById('oauthResult');
+  try {
+    const r = await fetch(API + '/api/settings/reset-oauth', {method: 'POST'});
+    const d = await r.json();
+    el.innerHTML = `<div class="status-msg status-ok">${d.message}</div>`;
+    loadTraktUsers();
+  } catch(e) {
+    el.innerHTML = `<div class="status-msg status-err">Failed: ${e.message}</div>`;
+  }
+}
+
+async function createBackup() {
+  const el = document.getElementById('dbResult');
+  el.innerHTML = '<div class="status-msg" style="background:rgba(116,185,255,0.15);color:var(--blue);">Creating backup…</div>';
+  try {
+    const r = await fetch(API + '/api/db/backup', {method: 'POST'});
+    const d = await r.json();
+    if (d.status === 'ok') {
+      el.innerHTML = `<div class="status-msg status-ok">✓ Backup created: ${d.filename} (${(d.size_bytes/1024).toFixed(1)} KB)<br><a href="${API}/api/db/backup/${d.backup_id}" style="color:var(--accent-light);">Download</a></div>`;
+    } else {
+      el.innerHTML = `<div class="status-msg status-err">✗ ${d.reason}</div>`;
+    }
+  } catch(e) {
+    el.innerHTML = `<div class="status-msg status-err">Failed: ${e.message}</div>`;
+  }
+}
+
+async function restoreBackup(input) {
+  const file = input.files[0];
+  if (!file) return;
+  if (!confirm('WARNING: This will overwrite all current data. Continue?')) { input.value = ''; return; }
+  const el = document.getElementById('dbResult');
+  el.innerHTML = '<div class="status-msg" style="background:rgba(116,185,255,0.15);color:var(--blue);">Restoring…</div>';
+  const form = new FormData();
+  form.append('file', file);
+  try {
+    const r = await fetch(API + '/api/db/restore', {method: 'POST', body: form});
+    const d = await r.json();
+    el.innerHTML = d.status === 'ok'
+      ? `<div class="status-msg status-ok">✓ ${d.message}</div>`
+      : `<div class="status-msg status-err">✗ ${d.reason}</div>`;
+  } catch(e) {
+    el.innerHTML = `<div class="status-msg status-err">Failed: ${e.message}</div>`;
+  }
+  input.value = '';
+}
+
+async function factoryReset() {
+  if (!confirm('DELETE all users and data? This cannot be undone!')) return;
+  if (!confirm('Are you absolutely sure?')) return;
+  const el = document.getElementById('dangerResult');
+  try {
+    const r = await fetch(API + '/api/settings/factory-reset', {method: 'POST'});
+    const d = await r.json();
+    el.innerHTML = `<div class="status-msg status-ok">${d.message}</div>`;
+    loadSettings();
+    loadTraktUsers();
+  } catch(e) {
+    el.innerHTML = `<div class="status-msg status-err">Failed: ${e.message}</div>`;
+  }
+}
+
+loadSettings();
+loadTraktUsers();
+</script>
+</body>
+</html>
