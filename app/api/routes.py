@@ -22,7 +22,7 @@ from app.utils.redis_cache import get_redis
 
 from app.security.auth import get_current_user, require_user_ownership, issue_tokens
 
-from app.services.watch_party.service import WatchPartyService
+from app.services.watch_party.service import _get_service as _get_watch_party_service
 from app.utils.database import async_session as async_session_ctx
 
 
@@ -35,7 +35,9 @@ async def _first_emby_user_id() -> str | None:
     return user.emby_user_id if user else None
 
 
-watch_party_svc = WatchPartyService()
+def _wp() -> "WatchPartyService":  # noqa: F821
+    """Return the module-level WatchPartyService singleton."""
+    return _get_watch_party_service()
 
 log = structlog.get_logger()
 
@@ -257,14 +259,14 @@ class JoinPartyRequest(BaseModel):
 @router.post("/party/create")
 async def create_party(body: CreatePartyRequest):
     try:
-        return await watch_party_svc.create_party(body.host_user_id, body.emby_item_id)
+        return await _wp().create_party(body.host_user_id, body.emby_item_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
 
 
 @router.post("/party/join")
 async def join_party(body: JoinPartyRequest):
-    result = await watch_party_svc.join_party(body.code, body.user_id)
+    result = await _wp().join_party(body.code, body.user_id)
     if not result:
         raise HTTPException(404, "Party not found or has ended")
     return result
@@ -272,20 +274,20 @@ async def join_party(body: JoinPartyRequest):
 
 @router.post("/party/{code}/end")
 async def end_party(code: str):
-    await watch_party_svc.end_party(code)
+    await _wp().end_party(code)
     return {"status": "ended"}
 
 
 @router.post("/party/{code}/start")
 async def start_party_playback(code: str):
     """Start playback on all participants' Emby sessions simultaneously."""
-    return await watch_party_svc.start_playback(code)
+    return await _wp().start_playback(code)
 
 
 @router.get("/party/{code}/sessions")
 async def list_party_sessions(code: str):
     """List active Emby sessions for party participants (device picker)."""
-    return await watch_party_svc.list_sessions_for_party(code)
+    return await _wp().list_sessions_for_party(code)
 
 
 @router.post("/party/{code}/start-selected")
@@ -295,25 +297,25 @@ async def start_selected_playback(code: str, payload: dict):
     item_id = payload.get("emby_item_id")
     if not session_ids:
         raise HTTPException(400, "No sessions selected")
-    return await watch_party_svc.start_playback_on_sessions(code, session_ids, item_id)
+    return await _wp().start_playback_on_sessions(code, session_ids, item_id)
 
 
 @router.post("/party/{code}/pause")
 async def pause_party_playback(code: str):
     """Toggle pause/play on all participants' Emby sessions."""
-    return await watch_party_svc.pause_all(code)
+    return await _wp().pause_all(code)
 
 
 @router.post("/party/{code}/seek")
 async def seek_party_playback(code: str, payload: dict):
     """Seek all participants to a specific position."""
     position_ticks = payload.get("position_ticks", 0)
-    return await watch_party_svc.seek_all(code, position_ticks)
+    return await _wp().seek_all(code, position_ticks)
 
 
 @router.get("/party/{code}")
 async def get_party(code: str):
-    result = await watch_party_svc.get_party(code)
+    result = await _wp().get_party(code)
     if not result:
         raise HTTPException(404, "Party not found")
     return result
@@ -321,13 +323,13 @@ async def get_party(code: str):
 
 @router.get("/parties")
 async def list_parties():
-    return await watch_party_svc.list_active_parties()
+    return await _wp().list_active_parties()
 
 
 @router.get("/parties/recent")
 async def list_recent_parties(limit: int = Query(10, ge=1, le=50)):
     """Return recently ended parties for the watch party lobby."""
-    return await watch_party_svc.list_recent_parties(limit)
+    return await _wp().list_recent_parties(limit)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -476,8 +478,8 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     # ── playback.start → Trakt scrobble/start ───────────────────────────────
     if is_play_start:
         if user.trakt_access_token:
+            trakt = await _get_trakt_client()
             try:
-                trakt = await _get_trakt_client()
                 scrobble = _build_scrobble_payload()
                 if scrobble:
                     progress = _calc_progress()
@@ -487,6 +489,8 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             except Exception as e:
                 log.warning("webhook.trakt_scrobble_start_failed", error=str(e))
                 await _activity_log(f"⚠ Trakt start failed: {item_name} — {str(e)[:80]}", category="trakt")
+            finally:
+                await trakt.close()
         return {"status": "received", "event": event_type, "trakt_synced": trakt_synced}
 
     # ── playback.pause → Trakt scrobble/pause ───────────────────────────────
@@ -499,8 +503,8 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                     category="trakt",
                 )
             else:
+                trakt = await _get_trakt_client()
                 try:
-                    trakt = await _get_trakt_client()
                     scrobble = _build_scrobble_payload()
                     if scrobble:
                         await trakt.scrobble_pause(scrobble, progress=progress)
@@ -521,13 +525,15 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                     else:
                         log.warning("webhook.trakt_scrobble_pause_failed", error=err_str)
                         await _activity_log(f"⚠ Trakt pause failed: {item_name} — {err_str[:80]}", category="trakt")
+                finally:
+                    await trakt.close()
         return {"status": "received", "event": event_type, "trakt_synced": trakt_synced}
 
     # ── playback.unpause → Trakt scrobble/start (resume) ────────────────────
     if is_play_unpause:
         if user.trakt_access_token:
+            trakt = await _get_trakt_client()
             try:
-                trakt = await _get_trakt_client()
                 scrobble = _build_scrobble_payload()
                 if scrobble:
                     progress = _calc_progress()
@@ -542,6 +548,8 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             except Exception as e:
                 log.warning("webhook.trakt_scrobble_resume_failed", error=str(e))
                 await _activity_log(f"⚠ Trakt resume failed: {item_name} — {str(e)[:80]}", category="trakt")
+            finally:
+                await trakt.close()
         return {"status": "received", "event": event_type, "trakt_synced": trakt_synced}
 
     # ── playback.stop / item.markplayed → Trakt watch history ───────────────
@@ -552,9 +560,8 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         )
 
         if user.trakt_access_token:
+            trakt = await _get_trakt_client()
             try:
-                trakt = await _get_trakt_client()
-
                 provider_ids = item_data.get("ProviderIds", {})
                 trakt_ids = {}
                 if provider_ids.get("Imdb"):
@@ -618,6 +625,8 @@ async def emby_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             except Exception as e:
                 log.error("webhook.trakt_sync_failed", error=str(e), user=user.id)
                 await _activity_log(f"✗ Trakt sync failed: {item_name} — {str(e)[:80]}", category="trakt")
+            finally:
+                await trakt.close()
         else:
             await _activity_log(
                 f"Skipped Trakt sync: {item_name} — user has no Trakt token",
