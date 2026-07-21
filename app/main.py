@@ -25,7 +25,7 @@ from app.utils.logging import setup_logging, security_log
 from app.utils.database import init_db
 from app.utils.redis_cache import close_redis
 from app.api.routes import router
-from app.services.watch_party.service import sio as watch_party_sio, close_service
+from app.services.watch_party.service import sio as watch_party_sio
 
 log = structlog.get_logger()
 
@@ -35,28 +35,28 @@ log = structlog.get_logger()
 # ---------------------------------------------------------------------------
 
 class SecurityAuditMiddleware:
-    """Pure ASGI middleware that logs requests without wrapping them in
-    BaseHTTPMiddleware, which would intercept the Socket.IO mount and
-    cause 404s on /ws/socket.io."""
+    """Log all HTTP requests for security audit trail.
+
+    Implemented as a pure ASGI middleware instead of BaseHTTPMiddleware
+    because BaseHTTPMiddleware breaks Starlette sub-app mounts (the
+    Socket.IO ASGIApp mounted at /ws would 404 on every request).
+    """
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] not in ("http", "websocket"):
-            return await self.app(scope, receive, send)
+            await self.app(scope, receive, send)
+            return
 
         start_time = time.time()
         path = scope.get("path", "")
-        method = scope.get("method", "WS")
-        client = scope.get("client")
+        method = scope.get("method", "WEBSOCKET" if scope["type"] == "websocket" else "")
+        client = scope.get("client") or ("unknown", 0)
         client_ip = client[0] if client else "unknown"
 
-        security_log.info("http_request_received",
-            method=method, path=path, client_ip=client_ip,
-        )
-
-        status_code = None
+        status_code = 0
 
         async def send_wrapper(message):
             nonlocal status_code
@@ -67,15 +67,18 @@ class SecurityAuditMiddleware:
         try:
             await self.app(scope, receive, send_wrapper)
             duration = time.time() - start_time
-            if status_code and status_code >= 400:
+            if status_code >= 400:
                 security_log.warning("http_response_error",
-                    method=method, path=path,
+                    method=method,
+                    path=path,
                     status_code=status_code,
                     duration_ms=duration * 1000,
                 )
         except Exception as e:
             security_log.error("http_request_exception",
-                method=method, path=path, error=str(e),
+                method=method,
+                path=path,
+                error=str(e),
             )
             raise
 
@@ -96,7 +99,6 @@ async def lifespan(app: FastAPI):
     yield  # app is running
 
     # Shutdown
-    await close_service()
     await close_redis()
     log.info("watch_party.shutdown")
 

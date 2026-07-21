@@ -28,6 +28,15 @@ class EmbyClient:
         self._key = settings.emby_api_key
         self._client = httpx.AsyncClient(timeout=30.0)
 
+    # -- async context manager -----------------------------------------------
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+        return False
+
     # -- helpers -------------------------------------------------------------
 
     def _url(self, path: str) -> str:
@@ -159,7 +168,7 @@ class EmbyClient:
 
     async def get_item(self, item_id: str, user_id: str | None = None) -> dict:
         path = f"/Users/{user_id}/Items/{item_id}" if user_id else f"/Items/{item_id}"
-        return await self._get(path, {"Fields": "ProviderIds,Genres,Overview,People,Studios,RunTimeTicks"})
+        return await self._get(path, {"Fields": "ProviderIds,Genres,Overview,People,Studios,RunTimeTicks,Tags,Taglines,CommunityRating,OfficialRating"})
 
     async def get_library_items(
         self,
@@ -184,14 +193,21 @@ class EmbyClient:
         resp = await self.get_items(search_term=term, item_type=item_type, limit=20)
         return resp.get("Items", [])
 
-    async def get_items_by_ids(self, item_ids: list[str]) -> list[dict]:
-        """Batch fetch items by ID (single call). Works server-scope on all Emby
-        versions, unlike /Items/{id} which 404s on some builds."""
+    async def get_items_by_ids(self, item_ids: list[str], user_id: str | None = None) -> list[dict]:
+        """Batch fetch items by ID (single call).
+
+        When user_id is provided, uses /Users/{uid}/Items which returns
+        full item data on all Emby builds.  Server-scope /Items may omit
+        fields like Overview on some builds.
+        """
         if not item_ids:
             return []
-        resp = await self._get("/Items", {
+        fields = ("CommunityRating,OfficialRating,ProductionYear,ProviderIds,"
+                  "RunTimeTicks,Genres,Overview,Tags,Taglines,People,Studios")
+        path = f"/Users/{user_id}/Items" if user_id else "/Items"
+        resp = await self._get(path, {
             "Ids": ",".join(str(i) for i in item_ids),
-            "Fields": "CommunityRating,OfficialRating,ProductionYear,ProviderIds,RunTimeTicks,Genres",
+            "Fields": fields,
         })
         return resp.get("Items", [])
 
@@ -207,7 +223,7 @@ class EmbyClient:
             return await self.get_item(item_id)
         except Exception:
             pass
-        items = await self.get_items_by_ids([item_id])
+        items = await self.get_items_by_ids([item_id], user_id=user_id)
         return items[0] if items else None
 
     # -- Provider ID helpers -------------------------------------------------
@@ -346,10 +362,22 @@ class EmbyClient:
 
     # -- Playback control (for watch-party sync) -----------------------------
 
-    async def send_play_command(self, session_id: str, command: str) -> None:
-        """command: PlayPause | Stop | Seek | etc."""
+    async def send_play_command(
+        self, session_id: str, command: str,
+        controlling_user_id: str | None = None,
+    ) -> None:
+        """command: PlayPause | Stop | Seek | etc.
+
+        ControllingUserId tells Emby who is issuing the remote command.
+        Without it, some Emby clients silently ignore the command even
+        though the API returns 204.
+        """
+        params: dict[str, Any] = {}
+        if controlling_user_id:
+            params["ControllingUserId"] = controlling_user_id
         await self._post(
             f"/Sessions/{session_id}/Playing/{command}",
+            params=params,
         )
 
     async def play_item_on_session(

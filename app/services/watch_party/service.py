@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import random
 import string
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import socketio
@@ -20,8 +20,7 @@ import structlog
 from sqlalchemy import select, update, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
-from app.models.schema import WatchParty, WatchPartyParticipant, User
+from app.models.schema import WatchParty, WatchPartyParticipant, WatchPartyReaction, WatchPartyComment, User
 from app.utils.trakt_client import TraktClient
 from app.utils.emby_client import EmbyClient
 from app.utils.redis_cache import get_redis
@@ -30,6 +29,12 @@ from app.utils.database import async_session
 log = structlog.get_logger()
 
 # Socket.IO server — attached to the main ASGI app later
+# CORS: Always allow all origins for Socket.IO connections.
+# Party codes + auth provide the real access control layer, and
+# restricting origins here causes 403 on WebSocket upgrades when
+# the browser's Origin header doesn't exactly match the allowed
+# list (common with LAN IPs, proxies, and mixed http/https).
+
 sio = socketio.AsyncServer(
     async_mode="asgi",
     cors_allowed_origins="*",
@@ -45,10 +50,6 @@ def _generate_code(length: int = 6) -> str:
 class WatchPartyService:
     def __init__(self):
         self.emby = EmbyClient()
-
-    async def close(self):
-        """Close the underlying EmbyClient httpx session."""
-        await self.emby.close()
 
     # -----------------------------------------------------------------------
     # Party lifecycle (called from REST API)
@@ -103,7 +104,7 @@ class WatchPartyService:
             "title": title,
             "status": "waiting",
             "position": "0",
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         })
         await r.expire(f"party:{code}", 86400)
         
@@ -159,7 +160,7 @@ class WatchPartyService:
                 active_sessions = sum(
                     1 for s in sessions
                     if s.get("UserId") == user.emby_user_id
-                    and s.get("SupportsRemoteControl", False)
+                    and s.get("SupportsRemoteControl", True)
                 )
             except Exception:
                 pass
@@ -224,10 +225,15 @@ class WatchPartyService:
             # Update database
             await db.execute(
                 update(WatchParty).where(WatchParty.id == party_id).values(
-                    status="ended", ended_at=datetime.utcnow()
+                    status="ended", ended_at=datetime.now(timezone.utc).replace(tzinfo=None)
                 )
             )
             await db.commit()
+
+        # NEW: Post a summary comment to Trakt (reactions + participant count)
+        # via the host's account, before the Redis state is torn down.
+        if party:
+            await self._post_party_summary_to_trakt(party, len(participants))
 
         # Stop playback on all participant Emby sessions
         stopped = 0
@@ -235,13 +241,16 @@ class WatchPartyService:
             try:
                 sessions = await self.emby.get_sessions()
                 for session in sessions:
-                    if session.get("UserId", "") not in participant_emby_ids:
+                    session_user = session.get("UserId", "")
+                    if session_user not in participant_emby_ids:
                         continue
                     sid = session.get("Id", "")
                     if not sid or not session.get("NowPlayingItem"):
                         continue
                     try:
-                        await self.emby.send_play_command(sid, "Stop")
+                        await self.emby.send_play_command(
+                            sid, "Stop", controlling_user_id=session_user,
+                        )
                         stopped += 1
                     except Exception:
                         pass
@@ -357,30 +366,31 @@ class WatchPartyService:
         if not user.trakt_access_token:
             return
         
-        trakt = TraktClient(
-            access_token=user.trakt_access_token,
-            refresh_token=user.trakt_refresh_token,
-            token_expires=user.trakt_token_expires,
-            token_refresh_callback=self._make_token_callback(user),
-        )
         try:
+            trakt = TraktClient(
+                access_token=user.trakt_access_token,
+                refresh_token=user.trakt_refresh_token,
+                token_expires=user.trakt_token_expires,
+                token_refresh_callback=self._make_token_callback(user),
+            )
+            
             # Build Trakt item payload from Emby item
             item_type = emby_item.get("Type", "Movie").lower()
+            trakt_id = None
+            
+            # Extract Trakt ID from Emby's provider IDs
             provider_ids = emby_item.get("ProviderIds", {})
-            
-            payload = None
             if item_type == "movie":
-                tmdb_id = provider_ids.get("Tmdb")
-                if tmdb_id:
-                    payload = {"movie": {"ids": {"tmdb": int(tmdb_id)}}}
+                trakt_id = provider_ids.get("Tmdb")
+                if trakt_id:
+                    payload = {"movie": {"ids": {"tmdb": int(trakt_id)}}}
             else:  # episode or series
-                tvdb_id = provider_ids.get("Tvdb")
-                if tvdb_id:
-                    payload = {"show": {"ids": {"tvdb": int(tvdb_id)}}}
+                trakt_id = provider_ids.get("Tvdb")
+                if trakt_id:
+                    payload = {"show": {"ids": {"tvdb": int(trakt_id)}}}
             
-            if payload is None:
-                log.warning("watch_party.trakt_checkin_skip", reason="no_provider_id",
-                            item_type=item_type, item=emby_item.get("Name"))
+            if not trakt_id:
+                log.warning("watch_party.trakt_checkin_failed", reason="no_trakt_id", item=emby_item.get("Name"))
                 return
             
             # Checkin (optional message)
@@ -390,21 +400,20 @@ class WatchPartyService:
         
         except Exception as e:
             log.error("watch_party.trakt_checkin_error", user_id=user.id, error=str(e))
-        finally:
-            await trakt.close()
 
     async def _trakt_scrobble_stop(self, user: User, emby_item_id: str, position_ticks: int) -> None:
         """Send scrobble-stop to Trakt when party ends."""
         if not user.trakt_access_token:
             return
         
-        trakt = TraktClient(
-            access_token=user.trakt_access_token,
-            refresh_token=user.trakt_refresh_token,
-            token_expires=user.trakt_token_expires,
-            token_refresh_callback=self._make_token_callback(user),
-        )
         try:
+            trakt = TraktClient(
+                access_token=user.trakt_access_token,
+                refresh_token=user.trakt_refresh_token,
+                token_expires=user.trakt_token_expires,
+                token_refresh_callback=self._make_token_callback(user),
+            )
+            
             # Get item details from Emby
             item = await self.emby.get_item_safe(emby_item_id, user_id=user.emby_user_id)
             if not item:
@@ -422,9 +431,9 @@ class WatchPartyService:
                 tvdb_id = provider_ids.get("Tvdb")
                 if tvdb_id:
                     payload = {"show": {"ids": {"tvdb": int(tvdb_id)}}}
-            
-            if payload is None:
-                log.warning("watch_party.trakt_scrobble_skip", user_id=user.id, reason="no_provider_id", item_type=item_type)
+
+            if not payload:
+                log.warning("watch_party.scrobble_skip_no_id", item_id=emby_item_id, item_type=item_type)
                 return
             
             # Calculate progress (0-100)
@@ -440,19 +449,181 @@ class WatchPartyService:
             log.info("watch_party.trakt_scrobble", user_id=user.id, progress=f"{progress:.1f}%")
         
         except Exception as e:
-            log.error("watch_party.trakt_scrobble_error", user_id=user.id, error=str(e))
-        finally:
-            await trakt.close()
+            err_str = str(e)
+            # 409 Conflict means Trakt has no active scrobble session to stop
+            # — harmless when party ends without a prior scrobble/start
+            if "409" in err_str:
+                log.warning("watch_party.trakt_scrobble_409", user_id=user.id,
+                            detail="no active scrobble session on Trakt")
+            else:
+                log.error("watch_party.trakt_scrobble_error", user_id=user.id, error=err_str)
+
+    async def record_reaction(self, code: str, user_id: int | None, emoji: str, position_ticks: int) -> None:
+        """Persist an in-party emoji reaction so it can be rolled into the
+        end-of-party Trakt comment summary. Best-effort — a failure here
+        should never break the real-time broadcast that already happened."""
+        if not emoji:
+            return
+        try:
+            r = await get_redis()
+            state = await r.hgetall(f"party:{code}")
+            if not state:
+                return
+            party_id = int(state.get("id", 0))
+            if not party_id:
+                return
+
+            async with async_session() as db:
+                db.add(WatchPartyReaction(
+                    party_id=party_id,
+                    user_id=user_id,
+                    emoji=str(emoji)[:16],
+                    position_ticks=position_ticks or 0,
+                ))
+                await db.commit()
+        except Exception as e:
+            log.warning("watch_party.reaction_persist_failed", code=code, error=str(e))
+
+    async def record_comment(self, code: str, user_id: int | None, username: str, comment_text: str) -> None:
+        """Persist a user comment submitted during a watch party so it can
+        be included in the end-of-party Trakt comment. Best-effort."""
+        if not comment_text or not comment_text.strip():
+            return
+        try:
+            r = await get_redis()
+            state = await r.hgetall(f"party:{code}")
+            if not state:
+                return
+            party_id = int(state.get("id", 0))
+            if not party_id:
+                return
+
+            async with async_session() as db:
+                db.add(WatchPartyComment(
+                    party_id=party_id,
+                    user_id=user_id,
+                    username=str(username or "")[:128],
+                    comment_text=str(comment_text).strip()[:1000],
+                ))
+                await db.commit()
+        except Exception as e:
+            log.warning("watch_party.comment_persist_failed", code=code, error=str(e))
+
+    async def _post_party_summary_to_trakt(self, party: WatchParty, participant_count: int) -> None:
+        """Aggregate this party's reactions and user comments, then post a
+        summary comment to Trakt (via the host's account) when the party ends.
+
+        Skipped entirely if the host never linked Trakt, if the item can't
+        be resolved to a Trakt-recognised ID, or if the party had no
+        reactions, no comments, and only one participant.
+        """
+        try:
+            async with async_session() as db:
+                host = (await db.execute(
+                    select(User).where(User.id == party.host_user_id)
+                )).scalar_one_or_none()
+                if not host or not host.trakt_access_token:
+                    return
+
+                reactions = (await db.execute(
+                    select(WatchPartyReaction).where(WatchPartyReaction.party_id == party.id)
+                )).scalars().all()
+
+                comments = (await db.execute(
+                    select(WatchPartyComment)
+                    .where(WatchPartyComment.party_id == party.id)
+                    .order_by(WatchPartyComment.created_at)
+                )).scalars().all()
+
+                # Collect participant usernames for the comment
+                participants = (await db.execute(
+                    select(WatchPartyParticipant).where(WatchPartyParticipant.party_id == party.id)
+                )).scalars().all()
+                participant_names: list[str] = []
+                for p in participants:
+                    u = (await db.execute(
+                        select(User).where(User.id == p.user_id)
+                    )).scalar_one_or_none()
+                    if u:
+                        name = u.emby_username or u.trakt_username or f"User {u.id}"
+                        participant_names.append(name)
+
+            if not reactions and not comments and participant_count < 2:
+                return
+
+            item = await self.emby.get_item_safe(party.emby_item_id, user_id=host.emby_user_id)
+            if not item:
+                return
+            provider_ids = item.get("ProviderIds", {})
+            item_type = item.get("Type", "Movie").lower()
+
+            payload = None
+            if item_type == "movie":
+                tmdb_id = provider_ids.get("Tmdb")
+                if tmdb_id:
+                    payload = {"movie": {"ids": {"tmdb": int(tmdb_id)}}}
+            else:
+                tvdb_id = provider_ids.get("Tvdb")
+                if tvdb_id:
+                    payload = {"show": {"ids": {"tvdb": int(tvdb_id)}}}
+            if not payload:
+                log.warning("watch_party.comment_skip_no_id", party_id=party.id, item_type=item_type)
+                return
+
+            # Build emoji reaction summary
+            counts: dict[str, int] = {}
+            for r in reactions:
+                counts[r.emoji] = counts.get(r.emoji, 0) + 1
+            reaction_summary = ", ".join(
+                f"{emoji} x{n}" for emoji, n in sorted(counts.items(), key=lambda kv: -kv[1])
+            )
+
+            # Build user comments section
+            # Format: "Name - Their comment." for each user comment
+            comment_lines: list[str] = []
+            for c in comments:
+                name = c.username or f"User {c.user_id or '?'}"
+                comment_lines.append(f"{name} - {c.comment_text}")
+
+            # Assemble full Trakt comment
+            if participant_names:
+                names_str = ", ".join(participant_names)
+                parts = [f"Watched with {names_str} in a watch party."]
+            else:
+                parts = [f"Watched with {participant_count} people in a watch party."]
+            if comment_lines:
+                parts.append(" ".join(comment_lines))
+            if reaction_summary:
+                parts.append(f"Reactions: {reaction_summary}.")
+            comment = " ".join(parts)
+
+            trakt = TraktClient(
+                access_token=host.trakt_access_token,
+                refresh_token=host.trakt_refresh_token,
+                token_expires=host.trakt_token_expires,
+                token_refresh_callback=self._make_token_callback(host),
+            )
+            try:
+                await trakt.post_comment(payload, comment, spoiler=False)
+                log.info("watch_party.trakt_comment_posted", party_id=party.id,
+                         reactions=len(reactions), comments=len(comments))
+            finally:
+                await trakt.close()
+        except Exception as e:
+            log.error("watch_party.trakt_comment_error", party_id=party.id, error=str(e))
 
     def _make_token_callback(self, user: User):
         """Create a token refresh callback for a user."""
+        user_id = user.id  # capture PK; avoid closing over detached ORM object
+
         async def callback(access_token: str, refresh_token: str, expires: datetime) -> None:
             async with async_session() as db:
-                u = await db.merge(user)
-                u.trakt_access_token = access_token
-                u.trakt_refresh_token = refresh_token
-                u.trakt_token_expires = expires
-                await db.commit()
+                u = await db.get(User, user_id)
+                if u:
+                    u.trakt_access_token = access_token
+                    u.trakt_refresh_token = refresh_token
+                    u.trakt_token_expires = expires
+                    await db.commit()
         return callback
 
     async def list_sessions_for_party(self, code: str) -> dict:
@@ -500,11 +671,16 @@ class WatchPartyService:
 
     async def start_playback_on_sessions(
         self, code: str, session_ids: list[str], emby_item_id: str | None = None,
+        start_position_ticks: int = 0,
     ) -> dict:
         """Start playback on specific sessions only (user-selected devices).
 
-        Re-fetches live sessions server-side and verifies each requested
-        session belongs to a party participant before sending the play command.
+        Security: verifies each session_id belongs to a party participant
+        before sending the play command.  Passes ControllingUserId so that
+        Emby clients trust the remote control command.
+
+        If emby_item_id is provided, use that instead of the party default
+        (allows picking a specific quality version).
         """
         r = await get_redis()
         state = await r.hgetall(f"party:{code}")
@@ -517,7 +693,7 @@ class WatchPartyService:
 
         party_id = int(state["id"])
 
-        # Fetch participant emby_user_ids
+        # Build set of participant emby_user_ids for validation
         async with async_session() as db:
             rows = (await db.execute(
                 select(User.emby_user_id)
@@ -526,29 +702,32 @@ class WatchPartyService:
             )).all()
             participant_emby_ids = {row.emby_user_id for row in rows if row.emby_user_id}
 
-        # Re-fetch live sessions to build verified session_id → UserId map
-        live_sessions = await self.emby.get_sessions()
-        session_user_map = {}
-        for s in live_sessions:
-            sid = s.get("Id", "")
-            uid = s.get("UserId", "")
+        # Fetch live sessions to map session_id → UserId
+        sessions = await self.emby.get_sessions()
+        session_map: dict[str, str] = {}  # session_id → emby_user_id
+        for session in sessions:
+            sid = session.get("Id", "")
+            uid = session.get("UserId", "")
             if sid and uid and uid in participant_emby_ids:
-                if s.get("SupportsRemoteControl", False):
-                    session_user_map[sid] = uid
+                session_map[sid] = uid
+
+        # Only play on sessions that belong to party participants
+        requested = set(session_ids)
+        valid_ids = requested & set(session_map.keys())
+        rejected = requested - valid_ids
+        if rejected:
+            log.warning("watch_party.sessions_rejected",
+                        code=code, rejected=list(rejected),
+                        reason="not_a_participant_session")
 
         started = []
         failed = []
-        rejected = []
-        for sid in session_ids:
-            if sid not in session_user_map:
-                rejected.append(sid)
-                log.warning("watch_party.session_rejected",
-                            code=code, session_id=sid, reason="not_participant_or_not_live")
-                continue
+        for sid in valid_ids:
+            controlling_uid = session_map[sid]
             try:
                 await self.emby.play_item_on_session(
-                    sid, item_id, start_position_ticks=0,
-                    controlling_user_id=session_user_map[sid],
+                    sid, item_id, start_position_ticks=start_position_ticks,
+                    controlling_user_id=controlling_uid,
                 )
                 started.append(sid)
             except Exception as e:
@@ -558,7 +737,7 @@ class WatchPartyService:
         if emby_item_id:
             await r.hset(f"party:{code}", "item", emby_item_id)
 
-        return {"status": "ok", "started": len(started), "failed": failed, "rejected": rejected}
+        return {"status": "ok", "started": len(started), "failed": failed}
 
     # -----------------------------------------------------------------------
     # Emby Playback Control
@@ -568,8 +747,9 @@ class WatchPartyService:
         """Start playback on all participants' Emby sessions simultaneously.
 
         Finds each participant's active Emby session, then sends a PlayNow
-        command for the party's item to each one.  Sets party status to
-        'playing'.
+        command for the party's item to each one.  Passes ControllingUserId
+        set to each session's own user so the Emby client trusts the command.
+        Sets party status to 'playing'.
         """
         r = await get_redis()
         state = await r.hgetall(f"party:{code}")
@@ -686,6 +866,11 @@ class WatchPartyService:
 
         Called when the host seeks — sends the same position to every
         participant's active session so everyone stays in sync.
+
+        Sets a short-lived Redis flag per session so the webhook handler
+        skips the playback.pause events that Emby fires during a seek
+        (Emby pauses → seeks → resumes, which would otherwise spam Trakt
+        with scrobble/pause calls).
         """
         r = await get_redis()
         state = await r.hgetall(f"party:{code}")
@@ -711,6 +896,9 @@ class WatchPartyService:
             if not sid:
                 continue
             try:
+                # Suppress webhook pause processing for 10s — Emby fires
+                # playback.pause during seeks which would trigger Trakt scrobble
+                await r.setex(f"party_seek_suppress:{sid}", 10, "1")
                 await self.emby.send_play_state_command(
                     sid, "Seek", seek_ticks=position_ticks,
                 )
@@ -775,7 +963,7 @@ class WatchPartyService:
                         "watch_party.emby_sync",
                         session_id=session_id,
                         emby_user_id=emby_uid,
-                        event=event,
+                        action=event,
                     )
                 except Exception as e:
                     log.warning(
@@ -788,26 +976,9 @@ class WatchPartyService:
             log.error("watch_party.sync_playback_error", code=code, error=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton (avoids leaking httpx clients on every WS event)
-# ---------------------------------------------------------------------------
-
-_service_instance: WatchPartyService | None = None
-
-
-def _get_service() -> WatchPartyService:
-    global _service_instance
-    if _service_instance is None:
-        _service_instance = WatchPartyService()
-    return _service_instance
-
-
-async def close_service() -> None:
-    """Shut down the module-level singleton (called from app lifespan)."""
-    global _service_instance
-    if _service_instance is not None:
-        await _service_instance.close()
-        _service_instance = None
+# Module-level service instance for Socket.IO handlers (avoids creating
+# a new EmbyClient / httpx.AsyncClient on every websocket event)
+_sio_watch_party_svc = WatchPartyService()
 
 
 # ---------------------------------------------------------------------------
@@ -863,8 +1034,10 @@ async def playback_event(sid, data):
         "position": str(position),
     })
 
-    # Sync to Emby sessions (use module-level singleton to avoid leaking httpx clients)
-    asyncio.create_task(_get_service().sync_playback_to_emby(code, event, position))
+    # Sync to Emby sessions — skip for seek events because the HTTP
+    # POST /party/{code}/seek route already sends seeks via seek_all()
+    if event != "seek":
+        asyncio.create_task(_sio_watch_party_svc.sync_playback_to_emby(code, event, position))
 
     # broadcast to everyone else in the room (WebSocket)
     await sio.emit(
@@ -874,7 +1047,7 @@ async def playback_event(sid, data):
         skip_sid=sid,
     )
 
-    log.debug("ws.playback_event", code=code, event=event, position=position)
+    log.debug("ws.playback_event", code=code, action=event, position=position)
 
 
 @sio.event
@@ -886,6 +1059,28 @@ async def chat_message(sid, data):
 
 @sio.event
 async def reaction(sid, data):
-    """Emoji reaction: {code, user_id, emoji, position_ticks}."""
+    """Emoji reaction: {code, user_id, emoji, position_ticks}.
+
+    Broadcasts immediately (unchanged), and separately persists the
+    reaction (fire-and-forget) so it can be rolled into an end-of-party
+    Trakt comment summary.
+    """
     code = data.get("code", "")
     await sio.emit("reaction", data, room=code, skip_sid=sid)
+    asyncio.create_task(_sio_watch_party_svc.record_reaction(
+        code, data.get("user_id"), data.get("emoji", ""), data.get("position_ticks", 0),
+    ))
+
+
+@sio.event
+async def party_comment(sid, data):
+    """User comment for the Trakt summary: {code, user_id, username, text}.
+
+    Broadcasts to the room as a chat message (so everyone sees it) and
+    persists to DB so it gets included in the end-of-party Trakt comment.
+    """
+    code = data.get("code", "")
+    await sio.emit("chat_message", data, room=code, skip_sid=sid)
+    asyncio.create_task(_sio_watch_party_svc.record_comment(
+        code, data.get("user_id"), data.get("username", ""), data.get("text", ""),
+    ))
